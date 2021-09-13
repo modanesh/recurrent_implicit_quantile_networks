@@ -3,15 +3,16 @@ import math
 import json
 
 import gym
+import anomalous_gym
 import torch
 import random
+import models
 import sklearn
 import argparse
 import numpy as np
 import seaborn as sns
 import torch.nn as nn
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
 from detecta import detect_cusum
 from sklearn.metrics import roc_curve
 import torch.nn.functional as functional
@@ -19,130 +20,9 @@ from sklearn.neighbors import NearestNeighbors
 from matplotlib.animation import FuncAnimation
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
+from models import Memory_w_na, Transition_w_na, get_action
 
 sns.set()
-
-
-class IQN(nn.Module):
-    def __init__(self, num_inputs, num_outputs, quantile_embedding_dim, num_quantile_sample, device, env_name=None, fc1_units=64, fc2_units=128):
-        super(IQN, self).__init__()
-        self.num_inputs = num_inputs
-        self.num_outputs = num_outputs
-        self.quantile_embedding_dim = quantile_embedding_dim
-        self.num_quantile_sample = num_quantile_sample
-        self.device = device
-        self.env_name = env_name
-        if env_name.__contains__("CartPole"):
-            fc1_units = 128
-            self.fc1 = nn.Linear(num_inputs, fc1_units)
-            self.fc2 = nn.Linear(fc1_units, num_outputs)
-            self.phi = nn.Linear(self.quantile_embedding_dim, fc1_units)
-        else:
-            self.fc1 = nn.Linear(num_inputs, fc1_units)
-            self.fc2 = nn.Linear(fc1_units, fc2_units)
-            self.fc3 = nn.Linear(fc2_units, num_outputs)
-            self.phi = nn.Linear(self.quantile_embedding_dim, fc2_units)
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-
-    def forward(self, state, tau, num_quantiles):
-        input_size = state.size()[0]  # batch_size(train) or 1(get_action)
-        tau = tau.expand(input_size * num_quantiles, self.quantile_embedding_dim)
-        pi_mtx = torch.Tensor(np.pi * np.arange(0, self.quantile_embedding_dim)).expand(input_size * num_quantiles, self.quantile_embedding_dim)
-        cos_tau = torch.cos(tau * pi_mtx)
-
-        phi = self.phi(cos_tau)
-        phi = F.relu(phi)
-
-        state_tile = state.expand(input_size, num_quantiles, self.num_inputs)
-        state_tile = state_tile.flatten().view(-1, self.num_inputs)
-
-        x = F.relu(self.fc1(state_tile))
-        if self.env_name.__contains__("CartPole"):
-            x = self.fc2(x * phi)
-        else:
-            x = F.relu(self.fc2(x))
-            x = self.fc3(x * phi)
-        z = x.view(-1, num_quantiles, self.num_outputs)
-
-        z = z.transpose(1, 2)  # [input_size, num_output, num_quantile]
-        return z
-
-    @classmethod
-    def train_model(cls, online_net, target_net, optimizer, batch, batch_size, num_tau_sample, device, num_tau_prime_sample, gamma):
-        states = torch.stack(batch.state)
-        next_states = torch.stack(batch.next_state)
-        actions = torch.Tensor(batch.action).long()
-        rewards = torch.Tensor(batch.reward)
-        masks = torch.Tensor(batch.mask)
-
-        tau = torch.Tensor(np.random.rand(batch_size * num_tau_sample, 1))
-        z = online_net(states, tau, num_tau_sample)
-        action = actions.unsqueeze(1).unsqueeze(1).expand(-1, 1, num_tau_sample)
-        z_a = z.gather(1, action.to(device)).squeeze(1)
-
-        tau_prime = torch.Tensor(np.random.rand(batch_size * num_tau_prime_sample, 1))
-        next_z = target_net(next_states, tau_prime, num_tau_prime_sample)
-        next_action = next_z.mean(dim=2).max(1)[1]
-        next_action = next_action.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, num_tau_prime_sample)
-        next_z_a = next_z.gather(1, next_action).squeeze(1)
-
-        T_z = rewards.to(device).unsqueeze(1) + gamma * next_z_a * masks.to(device).unsqueeze(1)
-
-        T_z_tile = T_z.view(-1, num_tau_prime_sample, 1).expand(-1, num_tau_prime_sample, num_tau_sample)
-        z_a_tile = z_a.view(-1, 1, num_tau_sample).expand(-1, num_tau_prime_sample, num_tau_sample)
-
-        error_loss = T_z_tile - z_a_tile
-        huber_loss = F.smooth_l1_loss(z_a_tile, T_z_tile.detach(), reduction='none')
-        tau = torch.arange(0, 1, 1 / num_tau_sample).view(1, num_tau_sample)
-
-        loss = (tau.to(device) - (error_loss < 0).float()).abs() * huber_loss
-        loss = loss.mean(dim=2).sum(dim=1).mean()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        return loss
-
-    @classmethod
-    def eval_model(cls, online_net, target_net, batch, batch_size, num_tau_sample, device, num_tau_prime_sample, gamma):
-        states = torch.stack(batch.state)
-        next_states = torch.stack(batch.next_state)
-        actions = torch.Tensor(batch.action).long()
-        rewards = torch.Tensor(batch.reward)
-        masks = torch.Tensor(batch.mask)
-
-        tau = torch.Tensor(np.random.rand(batch_size * num_tau_sample, 1))
-        z = online_net(states, tau, num_tau_sample)
-        action = actions.unsqueeze(1).unsqueeze(1).expand(-1, 1, num_tau_sample)
-        z_a = z.gather(1, action.to(device)).squeeze(1)
-
-        tau_prime = torch.Tensor(np.random.rand(batch_size * num_tau_prime_sample, 1))
-        next_z = target_net(next_states, tau_prime, num_tau_prime_sample)
-        next_action = next_z.mean(dim=2).max(1)[1]
-        next_action = next_action.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, num_tau_prime_sample)
-        next_z_a = next_z.gather(1, next_action).squeeze(1)
-
-        T_z = rewards.to(device).unsqueeze(1) + gamma * next_z_a * masks.to(device).unsqueeze(1)
-
-        T_z_tile = T_z.view(-1, num_tau_prime_sample, 1).expand(-1, num_tau_prime_sample, num_tau_sample)
-        z_a_tile = z_a.view(-1, 1, num_tau_sample).expand(-1, num_tau_prime_sample, num_tau_sample)
-
-        error_loss = T_z_tile - z_a_tile
-        huber_loss = F.smooth_l1_loss(z_a_tile, T_z_tile.detach(), reduction='none')
-        tau = torch.arange(0, 1, 1 / num_tau_sample).view(1, num_tau_sample)
-
-        loss = (tau.to(device) - (error_loss < 0).float()).abs() * huber_loss
-        loss = loss.mean(dim=2).sum(dim=1).mean()
-        return loss
-
-    def get_action(self, state, num_quantile_sample):
-        tau = torch.Tensor(np.random.rand(num_quantile_sample, 1) * 0.5)  # CVaR
-        z = self.forward(state, tau, num_quantile_sample)
-        q = z.mean(dim=2, keepdim=True)
-        action = torch.argmax(q)
-        return action.item(), z
 
 
 class AutoregressiveRecurrentIQN(nn.Module):
@@ -269,14 +149,6 @@ class AutoregressiveIQN(nn.Module):
 
         z = z.transpose(1, 2)  # [input_size, num_output, num_quantile]
         return z
-
-
-def get_action(state, target_net, epsilon, env, num_quantile_sample):
-    if np.random.rand() <= epsilon:
-        return env.action_space.sample(), None
-    else:
-        action, z = target_net.get_action(state, num_quantile_sample)
-        return action, z
 
 
 def train_model(model, optimizer, hx, states, target, batch_size, num_tau_sample, device, is_recurrent, clip_value, feature_len):
@@ -615,8 +487,7 @@ def plot_accuracy(feature_len, mc_returns, distributions, result_folder, anomaly
     fig, axs = plt.subplots(math.ceil(feature_len / 3), 3, figsize=(20, 20))
     r, c = 0, 0
     for i in range(feature_len):
-        for xxx in range(len(distributions[:, i])):
-            axs[r, c].scatter(np.zeros(len(distributions[:, i][xxx])) + xxx, distributions[:, i][xxx],
+        axs[r, c].scatter(np.zeros(len(distributions[:, i])), distributions[:, i],
                               marker='.', color='teal')
         axs[r, c].plot(mc_returns[:, i][:len(distributions[:, i])], color='limegreen')
         axs[r, c].axvline(x=anomaly_insertion, color='black')
@@ -777,8 +648,55 @@ def load_predictive_models(args, input_output_len, device):
     return model
 
 
+def test_policy(args, env, model, num_quantile_sample, data_path, total_episodes=10):
+    value_dist = []
+    total_reward = []
+    memory = Memory_w_na(args.replay_memory_capacity)
+    with torch.no_grad():
+        for ep in range(total_episodes):
+            ep_value_dist = []
+            state = env.reset()
+            state = torch.Tensor(state).unsqueeze(0)
+            done, ep_reward = False, 0
+
+            old_state = None
+            old_action = None
+            old_mask = None
+            old_reward = None
+
+            while not done:
+                action, z_values = get_action(state, model, -1, env, num_quantile_sample)
+                next_state, reward, done, _ = env.step(action)
+                next_state = torch.Tensor(next_state).unsqueeze(0)
+                mask = 0 if done else 1
+
+                if old_state is not None:
+                    memory.push(old_state, state, old_action, action, old_reward, old_mask)
+                if done:
+                    memory.push(state, state, action, action, reward, mask)
+
+                ep_value_dist.append(z_values.cpu().numpy()[0])
+                ep_reward += reward
+                old_state = state
+                old_action = action
+                old_mask = mask
+                old_reward = reward
+                state = next_state
+
+            total_reward.append(ep_reward)
+            print('------Episode', ep, 'test score=> {}'.format(ep_reward))
+            value_dist.append(np.array(ep_value_dist))
+        print('------Average test score=> {}'.format(sum(total_reward) / total_episodes))
+
+    torch.save(memory, data_path)
+    print("Optimal replay memory saved!")
+    return np.array(value_dist)
+
+
 def input_arg_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--test_policy', action='store_true', default=False,
+                        help="To test the trained IQN policy")
     parser.add_argument('--predictive_model_training', action='store_true', default=False,
                         help="To train autoregressive models")
     parser.add_argument('--predictive_model_testing', action='store_true', default=False,
@@ -811,6 +729,8 @@ def input_arg_parser():
                         help="Batch size")
     parser.add_argument('--lr', type=float, default=0.001,
                         help="Learning rate")
+    parser.add_argument('--replay_memory_capacity', type=int, default=10000000,
+                        help="Replay buffer capacity")
     parser.add_argument('--gru_units', type=int, default=64,
                         help="Number of cells in the GRU")
     parser.add_argument('--num_quantile_sample', type=int, default=64,
@@ -864,18 +784,25 @@ if __name__ == '__main__':
     env = gym.make(args.env_name)
     num_features = env.observation_space.shape[0]
     policy_model_path = os.path.join(results_path, "policy.pt")
-    policy_model = IQN(num_features, env.action_space.n, args.policy_quantile_embedding_dim,
+    policy_model = models.IQN(num_features, env.action_space.n, args.policy_quantile_embedding_dim,
                                   args.policy_num_quantile_sample, device, args.env_name)
     policy_model.load_state_dict(torch.load(policy_model_path, map_location=device))
 
     predictive_model = load_predictive_models(args, num_features, device)
-    if args.predictive_model_training:
+
+    if args.test_policy:
+        policy_model.to(device)
+        policy_model.eval()
+        optimal_p_memory_path = os.path.join(base_path, args.env_name, "optimal_p_memory.pt")
+        value_dist = test_policy(args, env, policy_model, args.num_quantile_sample, optimal_p_memory_path,
+                                 total_episodes=args.num_iterations)
+    elif args.predictive_model_training:
         print("Loading GVD training data!")
         optimal_p_memory_path = os.path.join(results_path, "optimal_p_memory.pt")
         optimal_memory = torch.load(optimal_p_memory_path, map_location=device)
         print("GVD data loaded!")
         train_rb, test_rb, max_len = construct_batch_data(num_features, optimal_memory, args.batch_size, device)
-        if os.path.exists(args.predictive_model_paths[0]):
+        if args.predictive_model_paths is not None and os.path.exists(args.predictive_model_paths[0]):
             print("Loading pre-trained model!")
             predictive_model.load_state_dict(torch.load(args.predictive_model_paths[0], map_location=device))
             print("Pre-trained model loaded:", args.predictive_model_paths[0])
@@ -1051,3 +978,4 @@ if __name__ == '__main__':
             epsilon = epsilon_decay(epsilon, args.num_iterations, i, args.decay_type)
         print("Saving the last model!")
         torch.save(predictive_model.state_dict(), final_predictive_model_path)
+
