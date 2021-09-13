@@ -18,7 +18,7 @@ matplotlib==3.3.0
 numpy==1.19.1
 opencv-python==4.5.3.56
 pandas==1.1.0
-Pillow==7.2.0
+Pillow==8.3.2
 pkg_resources==0.0.0
 protobuf==3.12.4
 -e git+https://github.com/modanesh/anomalous_rl_envs.git@928459d74e187e887d107309ec20ed350825742b#egg=pybullet&subdirectory=bullet3
