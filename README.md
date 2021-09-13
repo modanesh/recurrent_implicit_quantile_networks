@@ -139,9 +139,14 @@ optional arguments:
 ```
 
 ### How To Run
+First, you need to generate a dataset of nominal trajectories by the following command:
+```commandline
+python autoregressive_control.py --test_policy --env_name Acrobot-v1
+```
+
 To train the RIQN predictor:
 ```commandline
-python autoregressive_control.py --predictive_model_training --env_name Acrobot-v1 --is_recurrent_v2
+python autoregressive_control.py --predictive_model_training --env_name Acrobot-v1 --is_recurrent_v2 --predictive_model_paths "SOME PATHS"
 ```
 
 To test the RIQN predictor:
